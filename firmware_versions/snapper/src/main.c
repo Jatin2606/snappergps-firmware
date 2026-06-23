@@ -164,6 +164,9 @@ typedef struct {
     uint32_t measurementInterval;                 // Time between 2 snapshots in seconds
     uint32_t startTime;                           // Unix timestamp of first snapshot
     uint32_t endTime;                             // Unix timestamp of last snapshot
+    uint32_t dailyActiveStart;                    // Seconds since local midnight when daily recording starts
+    uint32_t dailyActiveEnd;                      // Seconds since local midnight when daily recording ends
+    int32_t dailyActiveUtcOffset;                 // Seconds east of UTC for daily recording window
 } usbMessageSetRecordIn_t;
 
 #pragma pack(pop)
@@ -228,6 +231,12 @@ static uint32_t measurementInterval = 20;
 static uint32_t startTime = 0;
 
 static uint32_t endTime = 0x7FFFFFFF;
+
+static uint32_t dailyActiveStart = 0;
+
+static uint32_t dailyActiveEnd = 0;
+
+static int32_t dailyActiveUtcOffset = 0;
 
 static uint16_t snapshotCount = 0;
 
@@ -344,6 +353,87 @@ static void setTime(uint32_t time, uint32_t ticks) {
     uint64_t requiredCounter = (uint64_t)time * LFXO_TICKS_PER_SECOND + (uint64_t)ticks;
 
     timeOffset = requiredCounter - (uint64_t)RTC_CounterGet();
+
+}
+
+static bool dailyActiveWindowEnabled() {
+
+    return dailyActiveStart != dailyActiveEnd;
+
+}
+
+static uint32_t getLocalSecondsSinceStartOfDay(uint32_t time) {
+
+    int64_t localSeconds = ((int64_t)time + (int64_t)dailyActiveUtcOffset) % SECONDS_IN_DAY;
+
+    if (localSeconds < 0) localSeconds += SECONDS_IN_DAY;
+
+    return (uint32_t)localSeconds;
+
+}
+
+static bool isInDailyActiveWindow(uint32_t time) {
+
+    if (!dailyActiveWindowEnabled()) return true;
+
+    uint32_t secondsSinceStartOfDay = getLocalSecondsSinceStartOfDay(time);
+
+    if (dailyActiveStart < dailyActiveEnd) {
+
+        return secondsSinceStartOfDay >= dailyActiveStart && secondsSinceStartOfDay < dailyActiveEnd;
+
+    }
+
+    return secondsSinceStartOfDay >= dailyActiveStart || secondsSinceStartOfDay < dailyActiveEnd;
+
+}
+
+static uint32_t getNextDailyActiveStart(uint32_t time) {
+
+    uint32_t secondsSinceStartOfDay = getLocalSecondsSinceStartOfDay(time);
+    int64_t activeStartToday = (int64_t)time - (int64_t)secondsSinceStartOfDay + (int64_t)dailyActiveStart;
+
+    if (dailyActiveStart < dailyActiveEnd) {
+
+        if (secondsSinceStartOfDay < dailyActiveStart) return (uint32_t)activeStartToday;
+
+        return (uint32_t)(activeStartToday + SECONDS_IN_DAY);
+
+    }
+
+    if (secondsSinceStartOfDay >= dailyActiveEnd && secondsSinceStartOfDay < dailyActiveStart) {
+
+        return (uint32_t)activeStartToday;
+
+    }
+
+    return (uint32_t)(activeStartToday + SECONDS_IN_DAY);
+
+}
+
+static uint32_t roundUpToMeasurementInterval(uint32_t time) {
+
+    time_t rawTime = time;
+
+    struct tm *tm = gmtime(&rawTime);
+
+    uint32_t secondsSinceStartOfDay = SECONDS_IN_HOUR * tm->tm_hour + SECONDS_IN_MINUTE * tm->tm_min + tm->tm_sec;
+
+    return time - secondsSinceStartOfDay + measurementInterval * ROUNDED_UP_DIV(secondsSinceStartOfDay, measurementInterval);
+
+}
+
+static void scheduleRecordingInterrupt(uint32_t targetTime, uint32_t time, uint32_t ticks, uint64_t counter, uint64_t *delayedStartCount) {
+
+    int64_t ticksUntilInterrupt = (int64_t)targetTime * LFXO_TICKS_PER_SECOND - (int64_t)time * LFXO_TICKS_PER_SECOND - (int64_t)ticks - TICKS_TO_CAPTURE;
+
+    if (ticksUntilInterrupt < MINIMUM_TICKS_TO_SLEEP) ticksUntilInterrupt += (int64_t)measurementInterval * LFXO_TICKS_PER_SECOND;
+
+    uint64_t compare = counter + ticksUntilInterrupt;
+
+    *delayedStartCount = compare >> 24;
+
+    RTC_CompareSet(RTC_COMP0, compare);
 
 }
 
@@ -600,6 +690,28 @@ int dataReceivedWebUSBCallback(USB_Status_TypeDef status, uint32_t xferred, uint
             // Unix timestamp of last snapshot
 
             endTime = configMsg->endTime;
+
+            if (xferred >= 25) {
+
+                dailyActiveStart = configMsg->dailyActiveStart;
+                dailyActiveEnd = configMsg->dailyActiveEnd;
+                dailyActiveUtcOffset = configMsg->dailyActiveUtcOffset;
+
+                if (dailyActiveStart >= SECONDS_IN_DAY || dailyActiveEnd >= SECONDS_IN_DAY) {
+
+                    dailyActiveStart = 0;
+                    dailyActiveEnd = 0;
+                    dailyActiveUtcOffset = 0;
+
+                }
+
+            } else {
+
+                dailyActiveStart = 0;
+                dailyActiveEnd = 0;
+                dailyActiveUtcOffset = 0;
+
+            }
 
             // Erase external flash memory next
 
@@ -1140,43 +1252,31 @@ int main(void) {
 
             getTime(&time, &ticks, &counter);
 
-            // Calculate the current time rounded up to the next integer measurement interval
+            // Calculate the first recording time from deployment start, interval, and daily active window
 
-            time_t rawTime = time;
+            uint32_t targetTime = MAX(roundUpToMeasurementInterval(time), startTime);
 
-            struct tm *tm = gmtime(&rawTime);
-
-            uint32_t secondsSinceStartOfDay = SECONDS_IN_HOUR * tm->tm_hour + SECONDS_IN_MINUTE * tm->tm_min + tm->tm_sec;
-
-            int64_t currentTimeRoundedUpToMeasurementInterval = (int64_t)time - (int64_t)secondsSinceStartOfDay + (int64_t)measurementInterval * (int64_t)ROUNDED_UP_DIV(secondsSinceStartOfDay, measurementInterval);
-
-            // Calculate the number of ticks until the later of the start time and the current time rounded up to the next integer measurement interval
-
-            int64_t ticksUntilFirstInterrupt = MAX(currentTimeRoundedUpToMeasurementInterval, (int64_t)startTime) * LFXO_TICKS_PER_SECOND - (int64_t)time * LFXO_TICKS_PER_SECOND - (int64_t)ticks - TICKS_TO_CAPTURE;
-
-            // Wait an extra measurement interval if there is not enough time to sleep
-
-            if (ticksUntilFirstInterrupt < MINIMUM_TICKS_TO_SLEEP) ticksUntilFirstInterrupt += (int64_t)measurementInterval * LFXO_TICKS_PER_SECOND;
-
-            // Increment the real-time counter compare register
-
-            uint64_t compare = counter + ticksUntilFirstInterrupt;
+            if (!isInDailyActiveWindow(targetTime)) targetTime = getNextDailyActiveStart(targetTime);
 
             // Remember higher bits of the 24-bit real-time counter compare register to count down to the real start time
 
-            uint64_t delayedStartCount = compare >> 24;
+            uint64_t delayedStartCount;
+
+            scheduleRecordingInterrupt(targetTime, time, ticks, counter, &delayedStartCount);
 
             // Enable interrupt using real-time counter with compare register 0
-
-            RTC_CompareSet(RTC_COMP0, compare);
 
             RTC_IntEnable(RTC_IEN_COMP0);
 
             // Enable interrupt to regularly flash LED while waiting using real-time counter with compare register 1
 
-            RTC_CompareSet(RTC_COMP1, counter + LED_INTERVAL_SECONDS * LFXO_TICKS_PER_SECOND);
+            if (!dailyActiveWindowEnabled()) {
 
-            RTC_IntEnable(RTC_IEN_COMP1);
+                RTC_CompareSet(RTC_COMP1, counter + LED_INTERVAL_SECONDS * LFXO_TICKS_PER_SECOND);
+
+                RTC_IntEnable(RTC_IEN_COMP1);
+
+            }
 
             NVIC_ClearPendingIRQ(RTC_IRQn);
 
@@ -1205,7 +1305,15 @@ int main(void) {
 
                     if (delayedStartCount == 0) {
 
-                        getTime(&time, &ticks, NULL);
+                        getTime(&time, &ticks, &counter);
+
+                        if (!isInDailyActiveWindow(time)) {
+
+                            scheduleRecordingInterrupt(getNextDailyActiveStart(time), time, ticks, counter, &delayedStartCount);
+                            eventRTC_Comp0 = false;
+                            goto sleep;
+
+                        }
 
                         if (!started) {
 
@@ -1225,7 +1333,11 @@ int main(void) {
 
                         // Check if end time is reached or flash memory is full
 
-                        if (time + measurementInterval >= endTime || flash_nextAddress + 2*3 > FLASH_NUM_PAGES) {
+                        uint32_t nextTime = time + measurementInterval;
+
+                        if (!isInDailyActiveWindow(nextTime)) nextTime = getNextDailyActiveStart(nextTime);
+
+                        if (nextTime >= endTime || flash_nextAddress + 2*3 > FLASH_NUM_PAGES) {
 
                             state = STATE_WILL_SHUTDOWN;
 
@@ -1241,9 +1353,7 @@ int main(void) {
 
                             // Update the real-time counter compare register for the next interrupt
 
-                            uint32_t compare = RTC_CompareGet(RTC_COMP0) + measurementInterval * LFXO_TICKS_PER_SECOND;
-
-                            RTC_CompareSet(RTC_COMP0, compare);
+                            scheduleRecordingInterrupt(nextTime, time, ticks, counter, &delayedStartCount);
 
                         }
 
@@ -1458,6 +1568,7 @@ int main(void) {
 
                 }
 
+sleep:
                 // Enter EM3 if recording more snapshots
 
                 if (state == STATE_WILL_RECORD)  EMU_EnterEM3(false);

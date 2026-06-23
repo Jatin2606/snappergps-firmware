@@ -707,9 +707,16 @@ typedef struct {
   usbMessageType_t msgType,
   uint32_t measurementInterval,          // Time between 2 snapshots in seconds
   uint32_t startTime,                    // Unix timestamp of first snapshot
-  uint32_t endTime                       // Unix timestamp of last snapshot
+  uint32_t endTime,                      // Unix timestamp of last snapshot
+  uint32_t dailyActiveStart,             // Seconds since local midnight when daily recording starts
+  uint32_t dailyActiveEnd,               // Seconds since local midnight when daily recording ends
+  int32_t dailyActiveUtcOffset           // Seconds east of UTC for daily recording window
 } usbMessageSetRecordIn_t;
 ```
+
+If `dailyActiveStart` and `dailyActiveEnd` are equal, the daily active
+window is disabled and snapshots are recorded at every measurement interval
+between `startTime` and `endTime`.
 
 ```C
 typedef struct {
@@ -780,4 +787,3 @@ This documentation is licensed under a
 
 [cc-by]: http://creativecommons.org/licenses/by/4.0/
 [cc-by-image]: https://i.creativecommons.org/l/by/4.0/88x31.png
-
